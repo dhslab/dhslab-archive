@@ -398,6 +398,30 @@ def download_restored_object(bucket_name, object_key, download_path, region='us-
         print(f"Error downloading object: {e}")
         sys.exit(1)
 
+def download_s3_object(s3_client, bucket, key, local_path):
+    """
+    Download an object from S3 with a simple progress bar.
+    """
+    try:
+        # 1) Determine the object size by doing a head_object
+        response = s3_client.head_object(Bucket=bucket, Key=key)
+        file_size = response['ContentLength']
+
+        # 2) Create the callback
+        progress = ProgressPercentage(local_path, file_size)
+
+        # 3) Download the file with the callback
+        s3_client.download_file(
+            Bucket=bucket,
+            Key=key,
+            Filename=local_path,
+            Callback=progress
+        )
+        print("\nDownload complete!")
+
+    except ClientError as e:
+        print(f"Error: {e}")
+
 
 def run_archive(config,filepath,archivepath,tarball=False,force=False,overwrite=False,keep=False): 
     # archivepath is either the S3 bucket or the local archive path, tarball is the tarball filename
@@ -574,7 +598,7 @@ def run_unarchive(config,filepath):
             # if is STANDARD_IA, then just download the object
             elif storage_class == 'STANDARD_IA' or storage_class == 'STANDARD' or storage_class == 'GLACIER_IR':
 
-                s3.download_file(archive_dict['ArchivePath'], archive_dict['Filename'], os.path.join(filepath,archive_dict['Filename']))
+                download_s3_object(archive_dict['ArchivePath'], archive_dict['Filename'], os.path.join(filepath,archive_dict['Filename']))
 
             else:
                 print(f"Storage class {storage_class} is not supported. Exiting.")

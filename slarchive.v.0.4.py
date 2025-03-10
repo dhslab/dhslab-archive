@@ -29,6 +29,7 @@
 import os
 import sys
 import glob
+import getpass
 import re
 import tarfile, gzip
 import hashlib
@@ -42,6 +43,9 @@ import random
 import string
 import threading
 import boto3
+
+from sqlalchemy import create_engine, MetaData, Table
+from sqlalchemy.exc import SQLAlchemyError
 
 from boto3.s3.transfer import TransferConfig
 from botocore.exceptions import ClientError
@@ -70,7 +74,6 @@ class ProgressPercentage:
                 f"({percentage:.2f}%)"
             )
             sys.stdout.flush()
-
 
 #
 # Helper functions
@@ -136,6 +139,10 @@ def init_config_file(config,args):
     config["storage_class"]    = prompt("storage_class", "S3 storage class")
     config["db"]               = prompt("db", "Database file/location")
 
+    # add username (not root) to the config
+    config["username"] = getpass.getuser()
+
+    
     # check if the database file exists
     if not os.path.isfile(config["db"]):
         print(f"Database file '{config['db']}' does not exist. Exiting.")
@@ -193,13 +200,21 @@ def get_files(filepath):
 
 def create_tarball(files, tarball_path):
     directory = os.path.dirname(tarball_path)
+    total_files = len(files)
+
     sys.stderr.write(f'Creating tarball...')
     sys.stderr.flush()
     with tarfile.open(tarball_path, 'w:gz') as tar:
-        for file in files:
-            tar.add(file, arcname=os.path.relpath(file, directory))
+        for i, file_path in enumerate(files, start=1):
+            arcname = os.path.relpath(file_path, directory)
+            tar.add(file_path, arcname=arcname)
 
-    sys.stderr.write(f' Done.\n')
+            # Calculate simple (file-count-based) progress
+            percent = (i / total_files) * 100
+            sys.stderr.write(f"\r[{i}/{total_files}] {percent:.1f}% done...")
+            sys.stderr.flush()
+
+    sys.stderr.write("\nDone.\n")
     sys.stderr.flush()
 
 def calculate_file_md5sum(file_path):
@@ -213,8 +228,8 @@ def calculate_file_md5sum(file_path):
 def test_tarball_integrity(tarball_path):
     try:
         with tarfile.open(tarball_path, 'r:gz') as tar:
-            for member in tar.getmembers():
-                tar.extract(member)
+            tar.getmembers()
+
     except Exception as e:
         print(f"Error: {e}")
         return False
@@ -227,12 +242,33 @@ def check_archive_path(path):
     return False
 
 def check_s3_bucket(bucket_name):
-    # dummy implementation; replace with your actual logic
+    # check that the bucket exists
+    s3_client = boto3.client('s3')
+    # get bucket 
+    try:
+        s3_client.head_bucket(Bucket=bucket_name)
+    except ClientError as e:
+        if e.response['Error']['Code'] == '404':
+            return False
+        else:
+            print(f"Error: {e}")
+            sys.exit(1)
+
     return True
 
 def check_s3_object(bucket_name, object_name):
-    # dummy implementation; replace with your actual logic
-    return False
+    # check that the object exists
+    s3_client = boto3.client('s3')
+    try:
+        s3_client.head_object(Bucket=bucket_name, Key=object_name)
+    except ClientError as e:
+        if e.response['Error']['Code'] == '404':
+            return False
+        else:
+            print(f"Error: {e}")
+            sys.exit(1)
+
+    return True
 
 def transfer_to_s3(bucket, region, tarball_path, overwrite=False, storage_class='STANDARD_IA'):
     # first check if the bucket exists
@@ -285,11 +321,38 @@ def transfer_to_local_archive(tarball_path, archive_path):
         return False
 
 # Upload the JSON file to the database
-def add_to_database(db, archive_dict):
-    # use sqlalchemy to add the json file to the database
-    pass
+def add_to_database(db_url, table_name, data):
+    """
+    Inserts a dictionary as a new row into the specified table using SQLAlchemy.
+    
+    Parameters:
+        db_url (str): SQLAlchemy database URL (e.g., "sqlite:///mydatabase.db")
+        table_name (str): Name of the table to insert data into.
+        data (dict): Dictionary with keys corresponding to column names.
+        
+    Returns:
+        True if insertion is successful, False otherwise.
+    """
+    # Create an engine and reflect the table
+    engine = create_engine(db_url)
+    metadata = MetaData()
+    try:
+        table = Table(table_name, metadata, autoload_with=engine)
+    except Exception as e:
+        print(f"Error reflecting table '{table_name}': {e}")
+        return False
 
-
+    # Use a transaction to insert the data
+    try:
+        # Using engine.begin() automatically handles commit/rollback.
+        with engine.begin() as connection:
+            # For a single row insert, pass a list with one dictionary.
+            connection.execute(table.insert(), [data])
+        return True
+    except SQLAlchemyError as e:
+        print(f"Error inserting data into '{table_name}': {e}")
+        return False
+    
 
 # Add json file to DynamoDB using boto3
 def add_to_dynamodb(table_name, record_dict, region_name=None):
@@ -380,7 +443,7 @@ def wait_for_restore(bucket_name, object_key, region='us-east-1', poll_interval=
 
         time.sleep(poll_interval)
 
-def download_restored_object(bucket_name, object_key, download_path, region='us-east-1'):
+def download_s3_object(bucket_name, object_key, download_path, region='us-east-1'):
     """
     Downloads the restored Deep Archive object to a local path.
 
@@ -398,31 +461,6 @@ def download_restored_object(bucket_name, object_key, download_path, region='us-
         print(f"Error downloading object: {e}")
         sys.exit(1)
 
-def download_s3_object(s3_client, bucket, key, local_path):
-    """
-    Download an object from S3 with a simple progress bar.
-    """
-    try:
-        # 1) Determine the object size by doing a head_object
-        response = s3_client.head_object(Bucket=bucket, Key=key)
-        file_size = response['ContentLength']
-
-        # 2) Create the callback
-        progress = ProgressPercentage(local_path, file_size)
-
-        # 3) Download the file with the callback
-        s3_client.download_file(
-            Bucket=bucket,
-            Key=key,
-            Filename=local_path,
-            Callback=progress
-        )
-        print("\nDownload complete!")
-
-    except ClientError as e:
-        print(f"Error: {e}")
-
-
 def run_archive(config,filepath,archivepath,tarball=False,force=False,overwrite=False,keep=False): 
     # archivepath is either the S3 bucket or the local archive path, tarball is the tarball filename
 
@@ -436,7 +474,8 @@ def run_archive(config,filepath,archivepath,tarball=False,force=False,overwrite=
         'LocalPath': '',
         'ArchivePath': archivepath,
         'Files': [],
-        'TarballMD5sum': ''
+        'TarballMD5sum': '',
+        'Username': config['username']
     }
 
     unique_id = ''
@@ -509,6 +548,7 @@ def run_archive(config,filepath,archivepath,tarball=False,force=False,overwrite=
     archive_dict['ArchivePath'] = archivepath
     archive_dict['Files'] = [ os.path.relpath(file, filepath) for file in fileDf['File'].tolist() ]
     archive_dict['TarballMD5sum'] = tarball_md5sum
+    archive_dict['Username'] = config['username']
 
     if config['mode'] == 'glacier':
         # upload the tarball to the S3 Glacier bucket
@@ -556,11 +596,11 @@ def run_archive(config,filepath,archivepath,tarball=False,force=False,overwrite=
 
     if config['database'] == 'sqlite':
         # upload the JSON file to the database
-        add_to_database(config['db'], archive_dict)
+        add_to_database(config['db'], config['db_table'], archive_dict)
 
     if config['database'] == 'dynamodb':
         # add the json file to DynamoDB
-        add_to_dynamodb(config['db'], archive_dict)
+        add_to_dynamodb(config['db'], config['db_table'], archive_dict)
 
 # Function to unarchive files from S3 Glacier
 def run_unarchive(config,filepath):
@@ -593,12 +633,12 @@ def run_unarchive(config,filepath):
                 wait_for_restore(archive_dict['ArchivePath'], archive_dict['Filename'], region=config['s3_region'])
 
                 # download the restored object
-                download_restored_object(archive_dict['ArchivePath'], archive_dict['Filename'], os.path.join(filepath,archive_dict['Filename']), region=config['s3_region'])
+                download_s3_object(archive_dict['ArchivePath'], archive_dict['Filename'], os.path.join(filepath,archive_dict['Filename']), region=config['s3_region'])
 
             # if is STANDARD_IA, then just download the object
             elif storage_class == 'STANDARD_IA' or storage_class == 'STANDARD' or storage_class == 'GLACIER_IR':
 
-                download_s3_object(archive_dict['ArchivePath'], archive_dict['Filename'], os.path.join(filepath,archive_dict['Filename']))
+                download_s3_object(archive_dict['ArchivePath'], archive_dict['Filename'], os.path.join(filepath,archive_dict['Filename']), region=config['s3_region'])
 
             else:
                 print(f"Storage class {storage_class} is not supported. Exiting.")
@@ -638,7 +678,8 @@ def main():
         's3_bucket': 'dhs-lab-archive-1',
         's3_region': 'us-east-1',
         'storage_class': 'STANDARD_IA',
-        'db': '/Users/dspencer/tmp/dhslabarchive.db'
+        'db': '/Users/dspencer/tmp/dhslabarchive.db',
+        'db_table': 'dhslabarchive',
     }
 
     # Main parser

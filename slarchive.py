@@ -57,6 +57,17 @@ from botocore.exceptions import ClientError
 # Classes
 #
 
+class TqdmUploadProgress:
+    def __init__(self, filename, desc=None):
+        self._filename = filename
+        self._size = os.path.getsize(filename)
+        if desc is None:
+            desc = f"Uploading {os.path.basename(filename)}"
+        self._tqdm = tqdm(total=self._size, unit='B', unit_scale=True, desc=desc)
+
+    def __call__(self, bytes_amount):
+        self._tqdm.update(bytes_amount)
+
 class ProgressPercentage:
     """A callable object that keeps track of upload progress and prints a progress bar."""
     def __init__(self, filename):
@@ -258,31 +269,25 @@ def create_tarball(files, tarball_path):
     directory = os.path.dirname(tarball_path)
     total_files = len(files)
 
-    sys.stderr.write(f'Creating tarball...')
-    sys.stderr.flush()
     with tarfile.open(tarball_path, 'w:gz') as tar:
-        for i, file_path in enumerate(files, start=1):
-            tar.add(os.path.join(directory,file_path), arcname=file_path)
+         for file_path in tqdm(files, desc="Creating tarball", unit="file"):
+            tar.add(os.path.join(directory, file_path), arcname=file_path)
+    
 
-            # Calculate simple (file-count-based) progress
-            percent = (i / total_files) * 100
-            sys.stderr.write(f"\r[{i}/{total_files}] {percent:.1f}% done...")
-            sys.stderr.flush()
-
-    sys.stderr.flush()
-
+    
 # Test integrity of the tarball by checking that its a valid tarball and extracting each file
 def test_tarball_integrity(tarball_path, md5sums):
     # md5sums must be a list of strings
     if not isinstance(md5sums, list):
         return False
-        
+
     # get tarball md5sums
     tarball_md5sums = get_tarball_md5sums(tarball_path)
     # convert md5sums to a set and do the same for the files and if they all match then
     # the tarball is valid and return true. If not, return false
     if set(tarball_md5sums['md5sum'].tolist()) == set(md5sums):
         return True
+        
     return False
 
 # function to list members of a tarball and return as a list
@@ -377,8 +382,12 @@ def transfer_to_s3(bucket, region, tarball_path, overwrite=False, storage_class=
         use_threads=True
     )
 
+    # print message with storage class
+    print(f"Uploading {os.path.basename(tarball_path)} to {bucket} with storage class {storage_class}...")
+
     # Create our progress callback
-    progress = ProgressPercentage(tarball_path)
+    #progress = ProgressPercentage(tarball_path)
+    progress = TqdmUploadProgress(tarball_path)
 
     # Start uploading
     try:
@@ -822,7 +831,7 @@ def run_archive(config,filepath,archivepath,tarball=False,force=False,overwrite=
     tarball_md5sum = calculate_file_md5sum(tarball)
 
     # test integrity of the tarball
-    if not test_tarball_integrity(tarball, fileDf['md5sums'].tolist()):
+    if not test_tarball_integrity(tarball, fileDf['md5sum'].tolist()):
         print(f"Tarball is not valid. Deleting and exiting.")
         if not keep:
             os.remove(tarball)

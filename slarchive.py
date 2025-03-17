@@ -203,8 +203,11 @@ def get_files(filepath):
         # Single file
         files = [filepath]
         filesizes = [os.path.getsize(filepath)]
+        
     elif os.path.isdir(filepath):
         # Directory
+
+        # get all files in the directory for a progress bar
         for root, dirs, f in os.walk(filepath):
             for file in f:
                 # skip files that match dhslabarchive.\S+.{tar.gz,json}
@@ -690,7 +693,7 @@ def check_restore_status(bucket_name, object_key, region='us-east-1'):
     restore_status = response.get('Restore')
     return restore_status
 
-def wait_for_restore(bucket_name, object_key, region='us-east-1', poll_interval=300):
+def wait_for_restore(bucket_name, object_key, region='us-east-1', poll_interval=120):
     """
     Polls until the object has been restored or an error occurs.
 
@@ -712,6 +715,8 @@ def wait_for_restore(bucket_name, object_key, region='us-east-1', poll_interval=
                 break
             else:
                 print(f"Restore still in progress. Status: {status}")
+                sys.stdout.flush()
+
         else:
             # If there's no 'Restore' field, it could mean the object isn't in a restorable state
             # or there's some issue with the object metadata.

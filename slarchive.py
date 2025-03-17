@@ -336,6 +336,14 @@ def check_s3_object(bucket_name, object_name):
 
     return True
 
+def check_storage_class(bucket_name, object_name, region='us-east-1'):
+    # get storage class of the object
+    s3 = boto3.client('s3', region_name=region)
+    response = s3.head_object(Bucket=bucket_name, Key=object_name)
+    storage_class = response['StorageClass']
+
+    return storage_class
+
 # upload file to the S3 bucket
 def transfer_to_s3(bucket, region, tarball_path, overwrite=False, storage_class='STANDARD_IA'):
     # first check if the bucket exists
@@ -692,6 +700,9 @@ def wait_for_restore(bucket_name, object_key, region='us-east-1', poll_interval=
     :param poll_interval: Time (seconds) between checks
     """
     print("Waiting for restore to complete...")
+    # flush stdout buffer to ensure the message is displayed
+    sys.stdout.flush()
+    
     while True:
         status = check_restore_status(bucket_name, object_key, region)
         if status:
@@ -888,16 +899,19 @@ def run_restore(config,filepath):
     with open(archive_json, 'r') as f:
         archive_dict = json.load(f)
 
-        if archive_dict['Location'] == 'glacier':
+        if archive_dict['Location'] == 'glacier':            
             # get storage class of the object
-            s3 = boto3.client('s3', region_name=config['s3_region'])
-            response = s3.head_object(Bucket=archive_dict['ArchivePath'], Key=archive_dict['Filename'])
-            storage_class = response['StorageClass']
+            storage_class = check_storage_class(archive_dict['ArchivePath'], archive_dict['Filename'], region=config['s3_region'])
 
             if storage_class == 'DEEP_ARCHIVE' or storage_class == 'GLACIER':
 
-                # initiate the restore request
-                initiate_deep_archive_restore(archive_dict['ArchivePath'], archive_dict['Filename'], region=config['s3_region'])
+                # check if the object is currently being restored
+                restore_status = check_restore_status(archive_dict['ArchivePath'], archive_dict['Filename'], region=config['s3_region'])
+
+                # if ongoing request is false, initiate the restore
+                if 'ongoing-request="false"' in restore_status:
+                    # initiate the restore request
+                    initiate_deep_archive_restore(archive_dict['ArchivePath'], archive_dict['Filename'], region=config['s3_region'])
 
                 # wait for the restore to complete
                 wait_for_restore(archive_dict['ArchivePath'], archive_dict['Filename'], region=config['s3_region'])
@@ -1007,7 +1021,7 @@ def main():
     parser_archive.add_argument('-s','--storage-class', type=str, help='S3 storage class')
 
     # the file/path to archive/unarchive
-    parser_archive.add_argument('filepath', type=is_valid_path, help='Path or file to archive')
+    parser_archive.add_argument('filepath', type=is_valid_path, nargs='+', help='Path or file to archive')
 
     parser_restore.add_argument('-c', '--config', type=is_valid_file, default='~/.dhslab-archive-config', help='Configuration file location')
     parser_restore.add_argument('-d', '--delete', action='store_true', help='Delete the archive tarball after restoring')
@@ -1126,16 +1140,19 @@ def main():
                 sys.exit(1)
 
         # expand/normalize args.filepath and get its absolute path
-        filepath = os.path.expanduser(args.filepath)  
-        filepath = os.path.abspath(filepath)            
+        for fp in args.filepath:
 
-        archive_dat = run_archive(config,filepath,archive_path,tarball=args.tarball,keep=args.keep,force=args.force,overwrite=args.overwrite)
+            filepath = os.path.expanduser(fp)
+            filepath = os.path.abspath(filepath)            
 
-        # add the archive to the database
-        if os.path.isfile(config['db']):
-            add_to_database(config['db'],config['archive_name'],archive_dat)
-        elif config['db'].startswith('arn:aws'):
-            add_to_dynamodb('archive_table',archive_dat)
+            archive_dat = run_archive(config,filepath,archive_path,tarball=args.tarball,keep=args.keep,force=args.force,overwrite=args.overwrite)
+
+            # add the archive to the database
+            if os.path.isfile(config['db']):
+                add_to_database(config['db'],config['archive_name'],archive_dat)
+                
+            elif config['db'].startswith('arn:aws'):
+                add_to_dynamodb('archive_table',archive_dat)
 
     elif args.subcommand == 'restore' and args.filepath:
             

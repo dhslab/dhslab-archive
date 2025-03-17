@@ -45,6 +45,7 @@ import random
 import string
 import threading
 import boto3
+from tqdm import tqdm 
 
 from sqlalchemy import create_engine, MetaData, Table, Column, Integer, String, inspect
 from sqlalchemy.exc import SQLAlchemyError
@@ -69,6 +70,7 @@ class ProgressPercentage:
         with self._lock:
             self._seen_so_far += bytes_amount
             percentage = (self._seen_so_far / self._size) * 100
+
             # Print progress on a single line with carriage return
             sys.stdout.write(
                 f"\rUploading {self._filename}  "
@@ -207,18 +209,20 @@ def get_files(filepath):
     elif os.path.isdir(filepath):
         # Directory
 
-        # get all files in the directory for a progress bar
+        # First, gather all files (excluding those that match your pattern)
+        all_files = []
         for root, dirs, f in os.walk(filepath):
             for file in f:
-                # skip files that match dhslabarchive.\S+.{tar.gz,json}
                 if re.match(r'dhslabarchive.\S+.tar.gz', file) or re.match(r'dhslabarchive.\S+.json', file):
                     continue
-
                 fullpath = os.path.join(root, file)
-                # append the relative path to the files list
-                files.append(os.path.relpath(fullpath, filepath))
-                filesizes.append(os.path.getsize(fullpath))
-                fileMd5sums.append(calculate_file_md5sum(fullpath))
+                all_files.append(fullpath)
+
+        # Now, process each file with a progress bar
+        for fullpath in tqdm(all_files, desc="Preparing files", unit="file"):
+            files.append(os.path.relpath(fullpath, filepath))
+            filesizes.append(os.path.getsize(fullpath))
+            fileMd5sums.append(calculate_file_md5sum(fullpath))
 
     else:
         print(f"'{filepath}' is not a valid file or directory path")
@@ -258,8 +262,7 @@ def create_tarball(files, tarball_path):
     sys.stderr.flush()
     with tarfile.open(tarball_path, 'w:gz') as tar:
         for i, file_path in enumerate(files, start=1):
-            arcname = os.path.relpath(file_path, directory)
-            tar.add(os.path.join(directory,file_path), arcname=arcname)
+            tar.add(os.path.join(directory,file_path), arcname=file_path)
 
             # Calculate simple (file-count-based) progress
             percent = (i / total_files) * 100
@@ -269,12 +272,16 @@ def create_tarball(files, tarball_path):
     sys.stderr.flush()
 
 # Test integrity of the tarball by checking that its a valid tarball and extracting each file
-def test_tarball_integrity(tarball_path, files):
+def test_tarball_integrity(tarball_path, md5sums):
+    # md5sums must be a list of strings
+    if not isinstance(md5sums, list):
+        return False
+        
     # get tarball md5sums
     tarball_md5sums = get_tarball_md5sums(tarball_path)
     # convert md5sums to a set and do the same for the files and if they all match then
     # the tarball is valid and return true. If not, return false
-    if set(tarball_md5sums['md5sum']) == set(files['md5sum']):
+    if set(tarball_md5sums['md5sum'].tolist()) == set(md5sums):
         return True
     return False
 
@@ -815,7 +822,7 @@ def run_archive(config,filepath,archivepath,tarball=False,force=False,overwrite=
     tarball_md5sum = calculate_file_md5sum(tarball)
 
     # test integrity of the tarball
-    if not test_tarball_integrity(tarball, fileDf):
+    if not test_tarball_integrity(tarball, fileDf['md5sums'].tolist()):
         print(f"Tarball is not valid. Deleting and exiting.")
         if not keep:
             os.remove(tarball)
@@ -864,8 +871,9 @@ def run_archive(config,filepath,archivepath,tarball=False,force=False,overwrite=
     if not keep:
         # remove all the files and directories in filepath/*
         for file in fileDf['file'].tolist():
-            if os.path.isfile(file):
-                os.remove(file)
+            fullpath = os.path.join(filepath,file)
+            if os.path.isfile(fullpath):
+                os.remove(fullpath)
             
         # walk through the directories in filepath and remove them if they are empty
         for root, dirs, files in os.walk(filepath, topdown=False):
@@ -943,7 +951,7 @@ def run_restore(config,filepath):
 
         # verify the tarball
         tarball = os.path.join(filepath,archive_dict['Filename'])
-        if not test_tarball_integrity(tarball):
+        if not test_tarball_integrity(tarball, archive_dict['MD5Sums']):
             print(f"Restored tarball is not valid. Exiting.")
             sys.exit(1)
 

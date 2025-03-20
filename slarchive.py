@@ -68,27 +68,6 @@ class TqdmUploadProgress:
     def __call__(self, bytes_amount):
         self._tqdm.update(bytes_amount)
 
-class ProgressPercentage:
-    """A callable object that keeps track of upload progress and prints a progress bar."""
-    def __init__(self, filename):
-        self._filename = filename
-        self._size = float(os.path.getsize(filename))
-        self._seen_so_far = 0
-        self._lock = threading.Lock()
-
-    def __call__(self, bytes_amount):
-        # The callback gets the number of bytes transferred for this chunk.
-        with self._lock:
-            self._seen_so_far += bytes_amount
-            percentage = (self._seen_so_far / self._size) * 100
-
-            # Print progress on a single line with carriage return
-            sys.stdout.write(
-                f"\rUploading {self._filename}  "
-                f"{self._seen_so_far:.0f} / {self._size:.0f} bytes  "
-                f"({percentage:.2f}%)"
-            )
-            sys.stdout.flush()
 
 #
 # Helper functions
@@ -272,9 +251,7 @@ def create_tarball(files, tarball_path):
     with tarfile.open(tarball_path, 'w:gz') as tar:
          for file_path in tqdm(files, desc="Creating tarball", unit="file"):
             tar.add(os.path.join(directory, file_path), arcname=file_path)
-    
-
-    
+ 
 # Test integrity of the tarball by checking that its a valid tarball and extracting each file
 def test_tarball_integrity(tarball_path, md5sums):
     # md5sums must be a list of strings
@@ -477,17 +454,16 @@ def globus_remove_file(path):
 # Globus transfer function
 def globus_transfer_to_archive(file_path,endpoint_id,destination_path):
 
-    sys.stderr.write(f'Checking destination directory...')
+    sys.stderr.write(f'Checking destination directory...\n')
 
     # Step 5: Check if the destination directory is present and create if not
     if not globus_path_exists(endpoint_id, destination_path):
         globus_create_directory(endpoint_id, destination_path)
-        sys.stderr.write(f'Done.\n')
 
     # Step 6: Initiate transfer and get the task id
     task_id = initiate_globus_transfer(f"{endpoint_id}:{file_path}", f"{endpoint_id}:{destination_path}/{os.path.basename(file_path)}")
 
-    sys.stderr.write(f'Transferring via globus (task id: {task_id})...')
+    sys.stderr.write(f'Transferring via globus (task id: {task_id})...\n')
     sys.stderr.flush()
 
     # Step 7: Wait for the transfer to complete
@@ -502,7 +478,6 @@ def globus_transfer_to_archive(file_path,endpoint_id,destination_path):
         sys.exit(1)
 
     sys.stderr.write(f'Done.\nTransfer successful.\n')
-
 
 #
 # Database functions
@@ -906,7 +881,7 @@ def run_archive(config,filepath,archivepath,tarball=False,force=False,overwrite=
 #
 
 # Function to unarchive files from S3 Glacier
-def run_restore(config,filepath):
+def run_restore(config,filepath,keep=False):
     # exit if filepath isnt a directory
     if not os.path.isdir(filepath):
         print(f"'{filepath}' is not a valid directory path")
@@ -958,25 +933,25 @@ def run_restore(config,filepath):
             print(f"Exiting.")
             sys.exit(1)
 
-        # verify the tarball
-        tarball = os.path.join(filepath,archive_dict['Filename'])
-        if not test_tarball_integrity(tarball, archive_dict['MD5Sums']):
-            print(f"Restored tarball is not valid. Exiting.")
-            sys.exit(1)
-
         # check tarball md5sum
         tarball_md5sum = calculate_file_md5sum(tarball)
         
         if tarball_md5sum != archive_dict['TarballMD5sum']:
             print(f"Tarball MD5sum does not match. Exiting.")
             sys.exit(1)
+
+        # verify the tarball
+        tarball = os.path.join(filepath,archive_dict['Filename'])
+        if not test_tarball_integrity(tarball, archive_dict['MD5Sums']):
+            print(f"Restored tarball is not valid. Exiting.")
+            sys.exit(1)
         
         # extract the tarball
-        with tarfile.open(tarball, 'r:gz') as tar:
-            tar.extractall(filepath)
+#        with tarfile.open(tarball, 'r:gz') as tar:
+#            tar.extractall(filepath)
 
-        # delete the tarball
-        os.remove(tarball)
+        print(f"{archive_dict['Filename']} successfully restored.")
+
 
 
 def main():
@@ -1166,6 +1141,9 @@ def main():
 
             filepath = os.path.expanduser(fp)
             filepath = os.path.abspath(filepath)            
+
+            # print directory that is being archived
+            print(f"Archiving {filepath} to {archive_path}")
 
             archive_dat = run_archive(config,filepath,archive_path,tarball=args.tarball,keep=args.keep,force=args.force,overwrite=args.overwrite)
 

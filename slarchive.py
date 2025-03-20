@@ -180,6 +180,10 @@ def init_config_file(config,args):
 #
 
 def calculate_file_md5sum(file_path):
+    # if its an empty file, then return False
+    if os.path.getsize(file_path) == 0:
+        return False
+
     with open(file_path, 'rb') as f:
         # Memory-map the file, size 0 means whole file
         with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
@@ -210,8 +214,14 @@ def get_files(filepath):
 
         # Now, process each file with a progress bar
         for fullpath in tqdm(all_files, desc="Preparing files", unit="file"):
+
+            # Skip empty files because mmap will fail otherwise
+            filesize = os.path.getsize(fullpath)
+            if filesize == 0:
+                continue
+
             files.append(os.path.relpath(fullpath, filepath))
-            filesizes.append(os.path.getsize(fullpath))
+            filesizes.append(filesize)
             fileMd5sums.append(calculate_file_md5sum(fullpath))
 
     else:

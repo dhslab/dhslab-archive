@@ -34,6 +34,7 @@ import getpass
 import re
 import tarfile, gzip
 import hashlib
+import mmap
 import time
 import pandas as pd
 import subprocess
@@ -44,6 +45,7 @@ import random
 import string
 import threading
 import boto3
+from tqdm import tqdm 
 
 from sqlalchemy import create_engine, MetaData, Table, Column, Integer, String, inspect
 from sqlalchemy.exc import SQLAlchemyError
@@ -55,26 +57,17 @@ from botocore.exceptions import ClientError
 # Classes
 #
 
-class ProgressPercentage:
-    """A callable object that keeps track of upload progress and prints a progress bar."""
-    def __init__(self, filename):
+class TqdmUploadProgress:
+    def __init__(self, filename, desc=None):
         self._filename = filename
-        self._size = float(os.path.getsize(filename))
-        self._seen_so_far = 0
-        self._lock = threading.Lock()
+        self._size = os.path.getsize(filename)
+        if desc is None:
+            desc = f"Uploading {os.path.basename(filename)}"
+        self._tqdm = tqdm(total=self._size, unit='B', unit_scale=True, desc=desc)
 
     def __call__(self, bytes_amount):
-        # The callback gets the number of bytes transferred for this chunk.
-        with self._lock:
-            self._seen_so_far += bytes_amount
-            percentage = (self._seen_so_far / self._size) * 100
-            # Print progress on a single line with carriage return
-            sys.stdout.write(
-                f"\rUploading {self._filename}  "
-                f"{self._seen_so_far:.0f} / {self._size:.0f} bytes  "
-                f"({percentage:.2f}%)"
-            )
-            sys.stdout.flush()
+        self._tqdm.update(bytes_amount)
+
 
 #
 # Helper functions
@@ -186,70 +179,112 @@ def init_config_file(config,args):
 # Archive functions
 #
 
+def calculate_file_md5sum(file_path):
+    # if its an empty file, then return False
+    if os.path.getsize(file_path) == 0:
+        return False
+
+    with open(file_path, 'rb') as f:
+        # Memory-map the file, size 0 means whole file
+        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            return hashlib.md5(mm).hexdigest()
+
 # get the list of files in the directory
 def get_files(filepath):
     files = []
     filesizes = []
+    fileMd5sums = []
 
     if os.path.isfile(filepath):
         # Single file
         files = [filepath]
         filesizes = [os.path.getsize(filepath)]
+        
     elif os.path.isdir(filepath):
         # Directory
+
+        # First, gather all files (excluding those that match your pattern)
+        all_files = []
         for root, dirs, f in os.walk(filepath):
             for file in f:
-                # skip files that match dhslabarchive.\S+.{tar.gz,json}
                 if re.match(r'dhslabarchive.\S+.tar.gz', file) or re.match(r'dhslabarchive.\S+.json', file):
                     continue
-
                 fullpath = os.path.join(root, file)
-                files.append(fullpath)
-                filesizes.append(os.path.getsize(fullpath))
+                all_files.append(fullpath)
+
+        # Now, process each file with a progress bar
+        for fullpath in tqdm(all_files, desc="Preparing files", unit="file"):
+
+            # Skip empty files because mmap will fail otherwise
+            filesize = os.path.getsize(fullpath)
+            if filesize == 0:
+                continue
+
+            files.append(os.path.relpath(fullpath, filepath))
+            filesizes.append(filesize)
+            fileMd5sums.append(calculate_file_md5sum(fullpath))
+
     else:
         print(f"'{filepath}' is not a valid file or directory path")
         sys.exit(1)
 
-    df = pd.DataFrame({'File': files, 'Size': filesizes})
+    df = pd.DataFrame({'file': files, 'size': filesizes, 'md5sum': fileMd5sums})
     return df
+
+def calculate_obj_md5sum(file_obj, chunk_size=256 * 1024):  # 256KB chunks
+    md5 = hashlib.md5()
+    while True:
+        chunk = file_obj.read(chunk_size)
+        if not chunk:
+            break
+        md5.update(chunk)
+    return md5.hexdigest()
+
+def get_tarball_md5sums(tarball_name):
+    tarball_md5sums = []
+    with tarfile.open(tarball_name, 'r:gz') as tar:
+        for member in tar.getmembers():
+            if member.isfile():
+                file_obj = tar.extractfile(member)
+                md5sum = calculate_obj_md5sum(file_obj)
+                # get size of file in bytes
+                size = member.size
+                tarball_md5sums.append((member.name, size, md5sum))
+
+    return pd.DataFrame(tarball_md5sums, columns=['file', 'size', 'md5sum'])
 
 # create a tarball of the files
 def create_tarball(files, tarball_path):
     directory = os.path.dirname(tarball_path)
     total_files = len(files)
 
-    sys.stderr.write(f'Creating tarball...')
-    sys.stderr.flush()
     with tarfile.open(tarball_path, 'w:gz') as tar:
-        for i, file_path in enumerate(files, start=1):
-            arcname = os.path.relpath(file_path, directory)
-            tar.add(file_path, arcname=arcname)
-
-            # Calculate simple (file-count-based) progress
-            percent = (i / total_files) * 100
-            sys.stderr.write(f"\r[{i}/{total_files}] {percent:.1f}% done...")
-            sys.stderr.flush()
-
-    sys.stderr.flush()
-
-# Calculate the MD5 checksum of a file
-def calculate_file_md5sum(file_path):
-    md5 = hashlib.md5()
-    with open(file_path, 'rb') as file:
-        for chunk in iter(lambda: file.read(4096), b''):
-            md5.update(chunk)
-    return md5.hexdigest()
-
+         for file_path in tqdm(files, desc="Creating tarball", unit="file"):
+            tar.add(os.path.join(directory, file_path), arcname=file_path)
+ 
 # Test integrity of the tarball by checking that its a valid tarball and extracting each file
-def test_tarball_integrity(tarball_path):
+def test_tarball_integrity(tarball_path, md5sums):
+    # md5sums must be a list of strings
+    if not isinstance(md5sums, list):
+        return False
+
+    # get tarball md5sums
+    tarball_md5sums = get_tarball_md5sums(tarball_path)
+    # convert md5sums to a set and do the same for the files and if they all match then
+    # the tarball is valid and return true. If not, return false
+    if set(tarball_md5sums['md5sum'].tolist()) == set(md5sums):
+        return True
+        
+    return False
+
+# function to list members of a tarball and return as a list
+def list_tarball_files(tarball_path):
     try:
         with tarfile.open(tarball_path, 'r:gz') as tar:
-            tar.getmembers()
-
+            return tar.getnames()
     except Exception as e:
         print(f"Error: {e}")
-        return False
-    return True
+        return []
 
 # function to check if archive path exists
 def check_archive_path(path):
@@ -303,6 +338,14 @@ def check_s3_object(bucket_name, object_name):
 
     return True
 
+def check_storage_class(bucket_name, object_name, region='us-east-1'):
+    # get storage class of the object
+    s3 = boto3.client('s3', region_name=region)
+    response = s3.head_object(Bucket=bucket_name, Key=object_name)
+    storage_class = response['StorageClass']
+
+    return storage_class
+
 # upload file to the S3 bucket
 def transfer_to_s3(bucket, region, tarball_path, overwrite=False, storage_class='STANDARD_IA'):
     # first check if the bucket exists
@@ -326,8 +369,12 @@ def transfer_to_s3(bucket, region, tarball_path, overwrite=False, storage_class=
         use_threads=True
     )
 
+    # print message with storage class
+    print(f"Uploading {os.path.basename(tarball_path)} to {bucket} with storage class {storage_class}...")
+
     # Create our progress callback
-    progress = ProgressPercentage(tarball_path)
+    #progress = ProgressPercentage(tarball_path)
+    progress = TqdmUploadProgress(tarball_path)
 
     # Start uploading
     try:
@@ -417,17 +464,16 @@ def globus_remove_file(path):
 # Globus transfer function
 def globus_transfer_to_archive(file_path,endpoint_id,destination_path):
 
-    sys.stderr.write(f'Checking destination directory...')
+    sys.stderr.write(f'Checking destination directory...\n')
 
     # Step 5: Check if the destination directory is present and create if not
     if not globus_path_exists(endpoint_id, destination_path):
         globus_create_directory(endpoint_id, destination_path)
-        sys.stderr.write(f'Done.\n')
 
     # Step 6: Initiate transfer and get the task id
     task_id = initiate_globus_transfer(f"{endpoint_id}:{file_path}", f"{endpoint_id}:{destination_path}/{os.path.basename(file_path)}")
 
-    sys.stderr.write(f'Transferring via globus (task id: {task_id})...')
+    sys.stderr.write(f'Transferring via globus (task id: {task_id})...\n')
     sys.stderr.flush()
 
     # Step 7: Wait for the transfer to complete
@@ -442,7 +488,6 @@ def globus_transfer_to_archive(file_path,endpoint_id,destination_path):
         sys.exit(1)
 
     sys.stderr.write(f'Done.\nTransfer successful.\n')
-
 
 #
 # Database functions
@@ -459,7 +504,9 @@ def create_archive_db(db_path, db_table):
             'Filename': <string>,
             'LocalPath': <string>,
             'ArchivePath': <string>,
-            'Files': <string>,         # a single file element (changed from a list)
+            'File': <string>,         # a single file element (changed from a list)
+            'Size': <integer>,         # a single file element (changed from a list)
+            'MD5Sum': <string>,         # a single file element (changed from a list)
             'TarballMD5sum': <string>,
             'Username': <string>
         }
@@ -484,7 +531,9 @@ def create_archive_db(db_path, db_table):
                           Column('Filename', String),
                           Column('LocalPath', String),
                           Column('ArchivePath', String),
-                          Column('Files', String),
+                          Column('File', String),
+                          Column('Size', Integer),
+                          Column('MD5sum', String),
                           Column('TarballMD5sum', String),
                           Column('Username', String)
                          )
@@ -544,7 +593,7 @@ def add_to_database(db_file, table_name, data):
     # convert dict to pandas dataframe
     df = pd.DataFrame([data], index=[0])
     # explode the list of files into separate rows
-    df = df.explode('Files')
+    df = df.explode(['Files','Sizes','MD5Sums'])
 
     # Create an engine and reflect the table
     engine = create_engine(f"sqlite:///{db_file}")
@@ -645,7 +694,7 @@ def check_restore_status(bucket_name, object_key, region='us-east-1'):
     restore_status = response.get('Restore')
     return restore_status
 
-def wait_for_restore(bucket_name, object_key, region='us-east-1', poll_interval=300):
+def wait_for_restore(bucket_name, object_key, region='us-east-1', poll_interval=120):
     """
     Polls until the object has been restored or an error occurs.
 
@@ -655,6 +704,9 @@ def wait_for_restore(bucket_name, object_key, region='us-east-1', poll_interval=
     :param poll_interval: Time (seconds) between checks
     """
     print("Waiting for restore to complete...")
+    # flush stdout buffer to ensure the message is displayed
+    sys.stdout.flush()
+    
     while True:
         status = check_restore_status(bucket_name, object_key, region)
         if status:
@@ -664,6 +716,8 @@ def wait_for_restore(bucket_name, object_key, region='us-east-1', poll_interval=
                 break
             else:
                 print(f"Restore still in progress. Status: {status}")
+                sys.stdout.flush()
+
         else:
             # If there's no 'Restore' field, it could mean the object isn't in a restorable state
             # or there's some issue with the object metadata.
@@ -702,7 +756,7 @@ def run_archive(config,filepath,archivepath,tarball=False,force=False,overwrite=
         'Filename': '',
         'LocalPath': '',
         'ArchivePath': archivepath,
-        'Files': [],
+        'Files': [],        
         'TarballMD5sum': '',
         'Username': config['username']
     }
@@ -730,11 +784,8 @@ def run_archive(config,filepath,archivepath,tarball=False,force=False,overwrite=
         # get the unique id from the tarball filename, which is dhslaarchive.<unique_id>.tar.gz
         unique_id = os.path.basename(tarball).split('.')[1]
 
-        # get the files in the tarball
-        with tarfile.open(tarball, 'r:gz') as tar:
-            files = [member.name for member in tar.getmembers()]
-            # get the list of files and their sizes
-            fileDf = pd.DataFrame({'File': files, 'Size': [tar.getmember(file).size for file in files]})
+        # get the files, sizes, and md5sums in the tarball
+        fileDf = get_tarball_md5sums(tarball)
 
         print(f"Archiving {tarball} to {archivepath}")
 
@@ -751,23 +802,25 @@ def run_archive(config,filepath,archivepath,tarball=False,force=False,overwrite=
             sys.exit(1)            
 
         # if sum of filesizes is greater than 2Tb, then exit
-        if fileDf['Size'].sum() > 2000000000000:
+        if fileDf['size'].sum() > 2000000000000:
             print(f"Total size of files is greater than 2Tb. Exiting.")
             sys.exit(1)
 
         # based on the config and the args, print the filepath, number of files, the total size of the files and where it will be archived
-        print(f"Archiving {fileDf.shape[0]} files in {filepath} with a total size of {readable_bytes(fileDf['Size'].sum())} bytes to {archivepath}")
+        print(f"Archiving {fileDf.shape[0]} files in {filepath} with a total size of {readable_bytes(fileDf['size'].sum())} bytes to {archivepath}")
 
         # create the tarball
-        create_tarball(fileDf['File'].tolist(), tarball)
+        create_tarball(fileDf['file'].tolist(), tarball)
 
     # get the md5sum of the tarball
     tarball_md5sum = calculate_file_md5sum(tarball)
 
     # test integrity of the tarball
-    if not test_tarball_integrity(tarball):
+    if not test_tarball_integrity(tarball, fileDf['md5sum'].tolist()):
         print(f"Tarball is not valid. Deleting and exiting.")
-        os.remove(tarball)
+        if not keep:
+            os.remove(tarball)
+
         sys.exit(1)
 
     # create a JSON file with the unique id, tarball filename, local path, archive path, list of files, and md5sum
@@ -775,7 +828,10 @@ def run_archive(config,filepath,archivepath,tarball=False,force=False,overwrite=
     archive_dict['Filename'] = os.path.basename(tarball)
     archive_dict['LocalPath'] = filepath
     archive_dict['ArchivePath'] = archivepath
-    archive_dict['Files'] = [ os.path.relpath(file, filepath) for file in fileDf['File'].tolist() ]
+    # store fileDf as list of tuples
+    archive_dict['Files'] = fileDf['file'].tolist()
+    archive_dict['Sizes'] = fileDf['size'].tolist()
+    archive_dict['MD5Sums'] = fileDf['md5sum'].tolist()
     archive_dict['TarballMD5sum'] = tarball_md5sum
     archive_dict['Username'] = config['username']
 
@@ -808,9 +864,10 @@ def run_archive(config,filepath,archivepath,tarball=False,force=False,overwrite=
     # if not keep, delete all the files
     if not keep:
         # remove all the files and directories in filepath/*
-        for file in fileDf['File'].tolist():
-            if os.path.isfile(file):
-                os.remove(file)
+        for file in fileDf['file'].tolist():
+            fullpath = os.path.join(filepath,file)
+            if os.path.isfile(fullpath):
+                os.remove(fullpath)
             
         # walk through the directories in filepath and remove them if they are empty
         for root, dirs, files in os.walk(filepath, topdown=False):
@@ -834,7 +891,7 @@ def run_archive(config,filepath,archivepath,tarball=False,force=False,overwrite=
 #
 
 # Function to unarchive files from S3 Glacier
-def run_restore(config,filepath):
+def run_restore(config,filepath,keep=False):
     # exit if filepath isnt a directory
     if not os.path.isdir(filepath):
         print(f"'{filepath}' is not a valid directory path")
@@ -849,16 +906,19 @@ def run_restore(config,filepath):
     with open(archive_json, 'r') as f:
         archive_dict = json.load(f)
 
-        if archive_dict['Location'] == 'glacier':
+        if archive_dict['Location'] == 'glacier':            
             # get storage class of the object
-            s3 = boto3.client('s3', region_name=config['s3_region'])
-            response = s3.head_object(Bucket=archive_dict['ArchivePath'], Key=archive_dict['Filename'])
-            storage_class = response['StorageClass']
+            storage_class = check_storage_class(archive_dict['ArchivePath'], archive_dict['Filename'], region=config['s3_region'])
 
             if storage_class == 'DEEP_ARCHIVE' or storage_class == 'GLACIER':
 
-                # initiate the restore request
-                initiate_deep_archive_restore(archive_dict['ArchivePath'], archive_dict['Filename'], region=config['s3_region'])
+                # check if the object is currently being restored
+                restore_status = check_restore_status(archive_dict['ArchivePath'], archive_dict['Filename'], region=config['s3_region'])
+
+                # if ongoing request is false, initiate the restore
+                if 'ongoing-request="false"' in restore_status:
+                    # initiate the restore request
+                    initiate_deep_archive_restore(archive_dict['ArchivePath'], archive_dict['Filename'], region=config['s3_region'])
 
                 # wait for the restore to complete
                 wait_for_restore(archive_dict['ArchivePath'], archive_dict['Filename'], region=config['s3_region'])
@@ -883,25 +943,25 @@ def run_restore(config,filepath):
             print(f"Exiting.")
             sys.exit(1)
 
-        # verify the tarball
-        tarball = os.path.join(filepath,archive_dict['Filename'])
-        if not test_tarball_integrity(tarball):
-            print(f"Restored tarball is not valid. Exiting.")
-            sys.exit(1)
-
         # check tarball md5sum
         tarball_md5sum = calculate_file_md5sum(tarball)
         
         if tarball_md5sum != archive_dict['TarballMD5sum']:
             print(f"Tarball MD5sum does not match. Exiting.")
             sys.exit(1)
+
+        # verify the tarball
+        tarball = os.path.join(filepath,archive_dict['Filename'])
+        if not test_tarball_integrity(tarball, archive_dict['MD5Sums']):
+            print(f"Restored tarball is not valid. Exiting.")
+            sys.exit(1)
         
         # extract the tarball
-        with tarfile.open(tarball, 'r:gz') as tar:
-            tar.extractall(filepath)
+#        with tarfile.open(tarball, 'r:gz') as tar:
+#            tar.extractall(filepath)
 
-        # delete the tarball
-        os.remove(tarball)
+        print(f"{archive_dict['Filename']} successfully restored.")
+
 
 
 def main():
@@ -965,10 +1025,10 @@ def main():
     # S3 Glacier options
     parser_archive.add_argument('-r','--region', type=str, default=default_config['s3_region'], help='AWS region to use')
     parser_archive.add_argument('-b','--bucket', type=str, default=default_config['s3_bucket'], help='AWS bucket')
-    parser_archive.add_argument('-s','--storage-class', type=str, default='STANDARD_IA', choices=['DEEP_ARCHIVE', 'GLACIER', 'GLACIER_IR', 'STANDARD', 'STANDARD_IA'], help='S3 storage class')
+    parser_archive.add_argument('-s','--storage-class', type=str, help='S3 storage class')
 
     # the file/path to archive/unarchive
-    parser_archive.add_argument('filepath', type=is_valid_path, help='Path or file to archive')
+    parser_archive.add_argument('filepath', type=is_valid_path, nargs='+', help='Path or file to archive')
 
     parser_restore.add_argument('-c', '--config', type=is_valid_file, default='~/.dhslab-archive-config', help='Configuration file location')
     parser_restore.add_argument('-d', '--delete', action='store_true', help='Delete the archive tarball after restoring')
@@ -977,19 +1037,21 @@ def main():
     # subparser for database commands
     parser_createdatabase = subparsers.add_parser('create-db', help='Create database commands')
     parser_createdatabase.add_argument('-c', '--config', type=is_valid_file, default='~/.dhslab-archive-config', help='Configuration file location')
-    parser_createdatabase.add_argument('-d', '--database-file', type=is_valid_file, help='Database file to create or use')
+    parser_createdatabase.add_argument('-d', '--database-file', type=str, help='Database file to create or use')
     parser_createdatabase.add_argument('-t', '--table', type=str, default='dhslabarchive', help='Set database table name [dhslabarchive]')
     parser_createdatabase.add_argument('-o', '--overwrite', action='store_true', help='Overwrite database if it already exists')
 
     # dump the database to a JSON file
     parser_database = subparsers.add_parser('db', help='Create database commands')
     parser_database.add_argument('-c', '--config', type=is_valid_file, default='~/.dhslab-archive-config', help='Configuration file location')
-    parser_database.add_argument('-d', '--database-file', type=is_valid_file, help='Database file to create or use')
+    parser_database.add_argument('-d', '--database-file', type=str, help='Database file to create or use')
     parser_database.add_argument('-t', '--table', type=str, default='dhslabarchive', help='Set database table name [dhslabarchive]')
     parser_database.add_argument('--dump', action='store_true', help='Dump the database to a JSON file')
     parser_database.add_argument('-s','--searchstring', type=str, help='Search the database for a string')
 
     args = parser.parse_args()
+
+    config = default_config
 
     # if the config command is called, then run the config function
     if args.subcommand == 'init':
@@ -1013,6 +1075,7 @@ def main():
             config['archive_name'] = args.table
 
         if os.path.isfile(config['db']):
+
             if not args.overwrite:
                 print(f"Database file {config['db']} already exists. Exiting.")
                 sys.exit(1)
@@ -1022,8 +1085,7 @@ def main():
                 create_archive_db(config['db'],config['archive_name'])
 
         else:
-            # print help
-            parser_database.print_help()
+            create_archive_db(config['db'],config['archive_name'])
 
     elif args.subcommand == 'db':
         if args.database_file:
@@ -1054,7 +1116,11 @@ def main():
         if args.database_file:
             config['db'] = args.database_file
         if args.storage_class:
-            config['storage_class'] = args.storage_class
+            if args.storage_class in ['DEEP_ARCHIVE', 'GLACIER', 'GLACIER_IR', 'STANDARD', 'STANDARD_IA']:
+                config['storage_class'] = args.storage_class
+            else:
+                print(f"Storage class {args.storage_class} is not supported. Exiting.")
+                sys.exit(1)
 
         archive_path = ''
 
@@ -1081,16 +1147,22 @@ def main():
                 sys.exit(1)
 
         # expand/normalize args.filepath and get its absolute path
-        filepath = os.path.expanduser(args.filepath)  
-        filepath = os.path.abspath(filepath)            
+        for fp in args.filepath:
 
-        archive_dat = run_archive(config,filepath,archive_path,tarball=args.tarball,keep=args.keep,force=args.force,overwrite=args.overwrite)
+            filepath = os.path.expanduser(fp)
+            filepath = os.path.abspath(filepath)            
 
-        # add the archive to the database
-        if os.path.isfile(config['db']):
-            add_to_database(config['db'],config['archive_name'],archive_dat)
-        elif config['db'].startswith('arn:aws'):
-            add_to_dynamodb('archive_table',archive_dat)
+            # print directory that is being archived
+            print(f"Archiving {filepath} to {archive_path}")
+
+            archive_dat = run_archive(config,filepath,archive_path,tarball=args.tarball,keep=args.keep,force=args.force,overwrite=args.overwrite)
+
+            # add the archive to the database
+            if os.path.isfile(config['db']):
+                add_to_database(config['db'],config['archive_name'],archive_dat)
+                
+            elif config['db'].startswith('arn:aws'):
+                add_to_dynamodb('archive_table',archive_dat)
 
     elif args.subcommand == 'restore' and args.filepath:
             

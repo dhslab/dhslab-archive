@@ -993,7 +993,6 @@ def main():
     parser_restore = subparsers.add_parser('restore', help='Restore files')
 
     # Archive options
-
     parser_archive.add_argument('-c', '--config', type=is_valid_file, default='~/.dhslab-archive-config', help='Configuration file location')
     # supplied path is a tarball
     parser_archive.add_argument('-t', '--tarball', action='store_true', default=False, help='Provided file path is a tarball to archive')
